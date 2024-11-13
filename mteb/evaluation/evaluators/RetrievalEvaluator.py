@@ -13,6 +13,7 @@ import pytrec_eval
 import torch
 import tqdm
 from sentence_transformers import CrossEncoder, SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from mteb.encoder_interface import Encoder, PromptType
 from mteb.model_meta import ModelMeta
@@ -33,6 +34,14 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Load the tokenizer and model
+classification_tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
+classification_model = AutoModelForSequenceClassification.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
+
+# Move the model to GPU if available
+if torch.cuda.is_available():
+    classification_model = classification_model.to("cuda")
+    
 
 def corpus_to_str(
     corpus: list[dict[str, str]] | dict[str, list[str]] | list[str],
@@ -184,6 +193,29 @@ class DenseRetrievalExactSearch:
                 if self.save_corpus_embeddings and request_qid:
                     self.corpus_embeddings[request_qid].append(sub_corpus_embeddings)
 
+            # Extract texts and define batch size
+            texts = corpus[corpus_start_idx:corpus_end_idx]
+            quality_scores = []
+            batch_size = 8
+
+            # Tokenize the batch of texts at once
+            for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                batch_texts = texts[i:i + batch_size]
+                inputs = classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
+                
+                # Forward pass for the batch
+                inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                outputs = classification_model(**inputs)
+                logits = outputs.logits.squeeze(-1).float().detach()
+                
+                # Apply sigmoid to each logit and store the scores
+                scores = torch.sigmoid(logits).cpu().numpy()
+                quality_scores.extend(scores.tolist())
+                
+            # Adjust shape
+            quality_scores = torch.tensor(quality_scores)
+            quality_scores.unsqueeze(0)
+            
             # Compute similarites using either cosine-similarity or dot product
             cos_scores = self.score_functions[score_function](
                 query_embeddings, sub_corpus_embeddings
@@ -194,6 +226,7 @@ class DenseRetrievalExactSearch:
                     f"Found {is_nan.sum()} NaN values in the similarity scores. Replacing NaN values with -1."
                 )
             cos_scores[is_nan] = -1
+            cos_scores = cos_scores * quality_scores
 
             # Get top-k values
             cos_scores_top_k_values, cos_scores_top_k_idx = torch.topk(
