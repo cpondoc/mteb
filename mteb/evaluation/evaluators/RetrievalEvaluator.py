@@ -34,7 +34,11 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Load the tokenizer and model
+# Load the custom tokenizer and model
+# classification_tokenizer = AutoTokenizer.from_pretrained("/home/cpondoc/research/embedding-preference-training/scratch/sample-run/final")
+# classification_model = AutoModelForSequenceClassification.from_pretrained("/home/cpondoc/research/embedding-preference-training/scratch/sample-run/final")
+
+# Load the Fineweb classifier
 classification_tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
 classification_model = AutoModelForSequenceClassification.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
 
@@ -226,7 +230,12 @@ class DenseRetrievalExactSearch:
                     f"Found {is_nan.sum()} NaN values in the similarity scores. Replacing NaN values with -1."
                 )
             cos_scores[is_nan] = -1
-            cos_scores = cos_scores * quality_scores
+            cos_scores = torch.sigmoid(cos_scores)
+            
+            # Adjust cos_scores
+            cos_scores *= 0.95  # Scale t2 by 0.9
+            cos_scores += 0.05 * quality_scores  # Add 0.1 * t1, broadcasting t1 to match t2
+            # cos_scores = cos_scores * quality_scores
 
             # Get top-k values
             cos_scores_top_k_values, cos_scores_top_k_idx = torch.topk(
