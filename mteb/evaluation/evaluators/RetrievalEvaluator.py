@@ -34,19 +34,6 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Load the custom tokenizer and model
-# classification_tokenizer = AutoTokenizer.from_pretrained("/home/cpondoc/research/embedding-preference-training/scratch/sample-run/final")
-# classification_model = AutoModelForSequenceClassification.from_pretrained("/home/cpondoc/research/embedding-preference-training/scratch/sample-run/final")
-
-# Load the Fineweb classifier
-classification_tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
-classification_model = AutoModelForSequenceClassification.from_pretrained("HuggingFaceTB/fineweb-edu-classifier")
-
-# Move the model to GPU if available
-if torch.cuda.is_available():
-    classification_model = classification_model.to("cuda")
-    
-
 def corpus_to_str(
     corpus: list[dict[str, str]] | dict[str, list[str]] | list[str],
 ) -> list[str]:
@@ -82,6 +69,18 @@ class DenseRetrievalExactSearch:
         # Model is class that provides encode_corpus() and encode_queries()
         self.model = model
         self.encode_kwargs = encode_kwargs
+        
+        # Handle all of the embedding preference training params
+        self.quality_p = kwargs["quality_p"]
+        self.quality_classifier = kwargs["quality_classifier"]
+        
+        # Load the Fineweb classifier
+        self.classification_tokenizer = AutoTokenizer.from_pretrained(kwargs["quality_classifier"])
+        self.classification_model = AutoModelForSequenceClassification.from_pretrained(kwargs["quality_classifier"])
+
+        # Move the model to GPU if available
+        if torch.cuda.is_available():
+            self.classification_model = self.classification_model.to("cuda")
 
         if "batch_size" not in encode_kwargs:
             encode_kwargs["batch_size"] = 128
@@ -205,16 +204,20 @@ class DenseRetrievalExactSearch:
             # Tokenize the batch of texts at once
             for i in tqdm.tqdm(range(0, len(texts), batch_size)):
                 batch_texts = texts[i:i + batch_size]
-                inputs = classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
+                inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
                 
                 # Forward pass for the batch
                 inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
-                outputs = classification_model(**inputs)
+                outputs = self.classification_model(**inputs)
                 logits = outputs.logits.squeeze(-1).float().detach()
                 
                 # Apply sigmoid to each logit and store the scores
-                scores = torch.sigmoid(logits).cpu().numpy()
-                quality_scores.extend(scores.tolist())
+                if self.quality_classifier == "HuggingFaceTB/fineweb-edu-classifier":
+                    scores = torch.sigmoid(logits).cpu().numpy()
+                    quality_scores.extend(scores.tolist())
+                else:
+                    scores = logits.cpu().numpy()
+                    quality_scores.extend(scores.tolist())
                 
             # Adjust shape
             quality_scores = torch.tensor(quality_scores)
@@ -230,12 +233,11 @@ class DenseRetrievalExactSearch:
                     f"Found {is_nan.sum()} NaN values in the similarity scores. Replacing NaN values with -1."
                 )
             cos_scores[is_nan] = -1
-            cos_scores = torch.sigmoid(cos_scores)
             
             # Adjust cos_scores
-            cos_scores *= 0.95  # Scale t2 by 0.9
-            cos_scores += 0.05 * quality_scores  # Add 0.1 * t1, broadcasting t1 to match t2
-            # cos_scores = cos_scores * quality_scores
+            cos_scores = torch.sigmoid(cos_scores)
+            cos_scores *= self.quality_p
+            cos_scores += (1 - self.quality_p) * quality_scores
 
             # Get top-k values
             cos_scores_top_k_values, cos_scores_top_k_idx = torch.topk(
