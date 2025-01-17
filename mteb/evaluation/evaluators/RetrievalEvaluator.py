@@ -16,6 +16,8 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 from transformers import AutoModel, AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
 from torch import nn
 from huggingface_hub import PyTorchModelHubMixin
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import math
 
 from mteb.encoder_interface import Encoder, PromptType
 from mteb.model_meta import ModelMeta
@@ -97,6 +99,11 @@ class DenseRetrievalExactSearch:
             self.classification_model = NvidiaDomainClassifier.from_pretrained(self.quality_classifier)
             self.classification_normalization = kwargs["classifier_normalization"]
             self.classification_model.eval()
+        
+        # Load GPT-2 Perplexity
+        elif self.quality_classifier == "gpt2":
+            self.classification_model = GPT2LMHeadModel.from_pretrained(self.quality_classifier)
+            self.classification_tokenizer = GPT2Tokenizer.from_pretrained(self.quality_classifier)
         
         # Load the Fineweb classifier
         else:
@@ -262,7 +269,37 @@ class DenseRetrievalExactSearch:
             batch_size = 8
 
             # Tokenize the batch of texts at once
-            if self.quality_classifier != "nvidia/domain-classifier":
+            if self.quality_classifier == "gpt2":
+                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                    batch_texts = texts[i:i + batch_size]
+                    
+                     # Ensure the tokenizer has a padding token
+                    if self.classification_tokenizer.pad_token is None:
+                        self.classification_tokenizer.pad_token = self.classification_tokenizer.eos_token
+                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)
+                    
+                    # Forward pass for the batch
+                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                    with torch.no_grad():
+                        outputs = self.classification_model(**inputs)
+                    
+                    # Calculate log-likelihood for each sequence in the batch
+                    log_likelihoods = []
+                    for idx in range(inputs["input_ids"].size(0)):
+                        input_ids = inputs["input_ids"][idx].unsqueeze(0)  # Process one sequence at a time
+                        labels = input_ids.clone()  # Labels are the same as input_ids for log-likelihood
+                        output = self.classification_model(input_ids=input_ids, labels=labels)
+                        loss = output.loss
+                        log_likelihood = -loss.item()
+                        log_likelihoods.append(log_likelihood)
+
+                    # Compute perplexities and normalize scores
+                    perplexities = [math.exp(-ll) for ll in log_likelihoods]
+                    normalized_scores = [1 / (1 + p) for p in perplexities]
+
+                    quality_scores.extend(normalized_scores)
+            
+            elif self.quality_classifier != "nvidia/domain-classifier":
                 for i in tqdm.tqdm(range(0, len(texts), batch_size)):
                     batch_texts = texts[i:i + batch_size]
                     inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
