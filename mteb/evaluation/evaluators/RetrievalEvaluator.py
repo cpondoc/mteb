@@ -13,7 +13,9 @@ import pytrec_eval
 import torch
 import tqdm
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModel, AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
+from torch import nn
+from huggingface_hub import PyTorchModelHubMixin
 
 from mteb.encoder_interface import Encoder, PromptType
 from mteb.model_meta import ModelMeta
@@ -55,6 +57,20 @@ def corpus_to_str(
         sentences = corpus
     return sentences
 
+class NvidiaDomainClassifier(nn.Module, PyTorchModelHubMixin):
+    def __init__(self, config):
+        super(NvidiaDomainClassifier, self).__init__()
+        self.model = AutoModel.from_pretrained(config["base_model"])
+        self.dropout = nn.Dropout(config["fc_dropout"])
+        self.fc = nn.Linear(self.model.config.hidden_size, len(config["id2label"]))
+
+    def forward(self, input_ids, attention_mask, **kwargs):  # Accept additional arguments
+        # Extract token_type_ids if present but ignore it
+        features = self.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        dropped = self.dropout(features)
+        outputs = self.fc(dropped)
+        return torch.softmax(outputs[:, 0, :], dim=1)
+
 
 # Adapted from https://github.com/beir-cellar/beir/blob/f062f038c4bfd19a8ca942a9910b1e0d218759d4/beir/retrieval/search/dense/exact_search.py#L12
 class DenseRetrievalExactSearch:
@@ -74,9 +90,18 @@ class DenseRetrievalExactSearch:
         self.quality_p = kwargs["quality_p"]
         self.quality_classifier = kwargs["quality_classifier"]
         
+        # Load the Nvidia Classifier
+        if self.quality_classifier == "nvidia/domain-classifier":
+            self.classification_config = AutoConfig.from_pretrained(self.quality_classifier)
+            self.classification_tokenizer = AutoTokenizer.from_pretrained(self.quality_classifier)
+            self.classification_model = NvidiaDomainClassifier.from_pretrained(self.quality_classifier)
+            self.classification_normalization = kwargs["classifier_normalization"]
+            self.classification_model.eval()
+        
         # Load the Fineweb classifier
-        self.classification_tokenizer = AutoTokenizer.from_pretrained(kwargs["quality_classifier"])
-        self.classification_model = AutoModelForSequenceClassification.from_pretrained(kwargs["quality_classifier"])
+        else:
+            self.classification_tokenizer = AutoTokenizer.from_pretrained(kwargs["quality_classifier"])
+            self.classification_model = AutoModelForSequenceClassification.from_pretrained(kwargs["quality_classifier"])
 
         # Move the model to GPU if available
         if torch.cuda.is_available():
@@ -195,28 +220,84 @@ class DenseRetrievalExactSearch:
                 )
                 if self.save_corpus_embeddings and request_qid:
                     self.corpus_embeddings[request_qid].append(sub_corpus_embeddings)
+            
+            # Softmax entropy normalization for NVIDIA domain classifier
+            def softmax_entropy(outputs):
+                softmax_entropy = -torch.sum(outputs * torch.log(outputs + 1e-12), dim=1)
 
+                # Normalize entropy to [0, 1]
+                num_classes = outputs.size(1)  # Number of classes
+                max_entropy = torch.log(torch.tensor(num_classes, dtype=torch.float32))  # Log of class count
+                normalized_entropy = softmax_entropy / max_entropy
+
+                # Adjust confidence using (1 - normalized_entropy)
+                adjusted_confidences = (1 - normalized_entropy) * torch.max(outputs, dim=1).values
+                return adjusted_confidences.cpu().detach().numpy()
+            
+            # Confidence threshold normalization for NVIDIA domain classifier
+            def confidence_threshold(outputs):
+                threshold = 0.5
+                default_confidence = 0.2  # Fallback value if confidence is below threshold
+
+                # Compute max probabilities
+                max_probs = torch.max(outputs, dim=1).values
+
+                # Apply confidence threshold
+                confidences = torch.where(max_probs > threshold, max_probs, torch.tensor(default_confidence))
+                return confidences.cpu().detach().numpy()
+            
+            # Top K aggregation for NVIDIA domain classifier
+            def top_k_aggregation(outputs):
+                k = 3  # Number of top probabilities to consider
+                # Get top-k probabilities
+                top_k_probs, _ = torch.topk(outputs, k, dim=1)
+
+                # Compute the average of top-k probabilities
+                top_k_confidences = top_k_probs.mean(dim=1)
+                return top_k_confidences.cpu().detach().numpy()
+            
             # Extract texts and define batch size
             texts = corpus[corpus_start_idx:corpus_end_idx]
             quality_scores = []
             batch_size = 8
 
             # Tokenize the batch of texts at once
-            for i in tqdm.tqdm(range(0, len(texts), batch_size)):
-                batch_texts = texts[i:i + batch_size]
-                inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
-                
-                # Forward pass for the batch
-                inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
-                outputs = self.classification_model(**inputs)
-                logits = outputs.logits.squeeze(-1).float().detach()
-                
-                # Apply sigmoid to each logit and store the scores
-                if self.quality_classifier == "HuggingFaceTB/fineweb-edu-classifier":
-                    scores = torch.sigmoid(logits).cpu().numpy()
-                    quality_scores.extend(scores.tolist())
-                else:
-                    scores = logits.cpu().numpy()
+            if self.quality_classifier != "nvidia/domain-classifier":
+                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                    batch_texts = texts[i:i + batch_size]
+                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
+                    
+                    # Forward pass for the batch
+                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                    outputs = self.classification_model(**inputs)
+                    logits = outputs.logits.squeeze(-1).float().detach()
+                    
+                    # Apply sigmoid to each logit and store the scores
+                    if self.quality_classifier == "HuggingFaceTB/fineweb-edu-classifier":
+                        scores = torch.sigmoid(logits).cpu().numpy()
+                        quality_scores.extend(scores.tolist())
+                    else:
+                        scores = logits.cpu().numpy()
+                        quality_scores.extend(scores.tolist())
+            
+            # Else, tokenize with respect to NVIDIA domain classifier
+            else:
+                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                    batch_texts = texts[i:i + batch_size]
+                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding="longest", truncation=True)                
+                    
+                    # Forward pass for the batch
+                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                    outputs = self.classification_model(**inputs)
+                    
+                    # Apply sigmoid to each logit and store the scores
+                    scores = None
+                    if self.classification_normalization == "top_k":
+                        scores = top_k_aggregation(outputs=outputs)
+                    if self.classification_normalization == "softmax_entropy":
+                        scores = softmax_entropy(outputs=outputs)
+                    else:
+                        scores = confidence_threshold(outputs=outputs)
                     quality_scores.extend(scores.tolist())
                 
             # Adjust shape
