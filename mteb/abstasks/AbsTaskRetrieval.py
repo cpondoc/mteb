@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from time import time
@@ -268,6 +269,24 @@ class AbsTaskRetrieval(AbsTask):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        
+    def get_noisy_docs(self):
+        """
+        Get all of the noisy stuff.
+        """
+        noisy_files = os.listdir("data/random-cc")
+        noisy_docs = []
+        
+        for file in noisy_files:
+            file_path = os.path.join("data/random-cc", file)
+            
+            if os.path.isfile(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                    doc = {"id": str(uuid.uuid4()), "text": text}
+                    noisy_docs.append(doc)
+        
+        return noisy_docs
 
     def load_data(self, **kwargs):
         if self.data_loaded:
@@ -292,6 +311,8 @@ class AbsTaskRetrieval(AbsTask):
             corpus = {
                 doc["id"]: doc.get("title", "") + " " + doc["text"] for doc in corpus
             }
+            noisy_docs = self.get_noisy_docs()
+            corpus = {**corpus, **{doc["id"]: doc.get("title", "") + " " + doc["text"] for doc in noisy_docs}}
             self.corpus[split], self.queries[split], self.relevant_docs[split] = (
                 corpus,
                 queries,
