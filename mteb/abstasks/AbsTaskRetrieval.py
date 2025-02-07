@@ -274,19 +274,26 @@ class AbsTaskRetrieval(AbsTask):
         """
         Get all of the noisy stuff.
         """
-        noisy_files = os.listdir("data/random-cc")
-        noisy_docs = []
-        
-        for file in noisy_files:
-            file_path = os.path.join("data/random-cc", file)
-            
-            if os.path.isfile(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                    doc = {"id": str(uuid.uuid4()), "text": text}
-                    noisy_docs.append(doc)
-        
-        return noisy_docs
+        # Load data from HF
+        dataset = load_dataset(
+        "cpondoc/noisy-cc",
+        data_files={"train": "data/*.csv"},
+        ignore_verifications=True,
+        keep_in_memory=True
+    )
+        train_data = dataset["train"]
+
+        # Convert dataset dictionary into list of dictionaries
+        processed_data = []
+        for i in range(len(train_data["text"])):  # Iterate through index positions
+            doc = {
+                "id": f"doc_{i}",
+                "url": train_data["url"][i] if "url" in train_data else "",
+                "text": train_data["text"][i]
+            }
+            processed_data.append(doc)
+
+        return processed_data
 
     def load_data(self, **kwargs):
         if self.data_loaded:
@@ -312,7 +319,7 @@ class AbsTaskRetrieval(AbsTask):
                 doc["id"]: doc.get("title", "") + " " + doc["text"] for doc in corpus
             }
             noisy_docs = self.get_noisy_docs()
-            corpus = {**corpus, **{doc["id"]: doc.get("title", "") + " " + doc["text"] for doc in noisy_docs}}
+            corpus = {**corpus, **{doc["id"]: doc.get("url", "") + " " + doc["text"] for doc in noisy_docs}}
             self.corpus[split], self.queries[split], self.relevant_docs[split] = (
                 corpus,
                 queries,

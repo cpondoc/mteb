@@ -89,8 +89,9 @@ class DenseRetrievalExactSearch:
         self.encode_kwargs = encode_kwargs
         
         # Handle all of the embedding preference training params
-        self.quality_p = kwargs["quality_p"]
-        self.quality_classifier = kwargs["quality_classifier"]
+        self.quality_p = encode_kwargs.get("quality_p", 0)
+        self.quality_classifier = encode_kwargs.get("quality_classifier", None)
+        self.classification_model = None
         
         # Load the Nvidia Classifier
         if self.quality_classifier == "nvidia/domain-classifier":
@@ -106,12 +107,12 @@ class DenseRetrievalExactSearch:
             self.classification_tokenizer = GPT2Tokenizer.from_pretrained(self.quality_classifier)
         
         # Load the Fineweb classifier
-        else:
+        elif self.quality_classifier == "fineweb":
             self.classification_tokenizer = AutoTokenizer.from_pretrained(kwargs["quality_classifier"])
             self.classification_model = AutoModelForSequenceClassification.from_pretrained(kwargs["quality_classifier"])
 
         # Move the model to GPU if available
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and self.classification_model:
             self.classification_model = self.classification_model.to("cuda")
 
         if "batch_size" not in encode_kwargs:
@@ -269,77 +270,78 @@ class DenseRetrievalExactSearch:
             batch_size = 8
 
             # Tokenize the batch of texts at once
-            if self.quality_classifier == "gpt2":
-                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
-                    batch_texts = texts[i:i + batch_size]
-                    
-                     # Ensure the tokenizer has a padding token
-                    if self.classification_tokenizer.pad_token is None:
-                        self.classification_tokenizer.pad_token = self.classification_tokenizer.eos_token
-                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)
-                    
-                    # Forward pass for the batch
-                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
-                    with torch.no_grad():
-                        outputs = self.classification_model(**inputs)
-                    
-                    # Calculate log-likelihood for each sequence in the batch
-                    log_likelihoods = []
-                    for idx in range(inputs["input_ids"].size(0)):
-                        input_ids = inputs["input_ids"][idx].unsqueeze(0)  # Process one sequence at a time
-                        labels = input_ids.clone()  # Labels are the same as input_ids for log-likelihood
-                        output = self.classification_model(input_ids=input_ids, labels=labels)
-                        loss = output.loss
-                        log_likelihood = -loss.item()
-                        log_likelihoods.append(log_likelihood)
+            if self.quality_classifier:
+                if self.quality_classifier == "gpt2":
+                    for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                        batch_texts = texts[i:i + batch_size]
+                        
+                        # Ensure the tokenizer has a padding token
+                        if self.classification_tokenizer.pad_token is None:
+                            self.classification_tokenizer.pad_token = self.classification_tokenizer.eos_token
+                        inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)
+                        
+                        # Forward pass for the batch
+                        inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                        with torch.no_grad():
+                            outputs = self.classification_model(**inputs)
+                        
+                        # Calculate log-likelihood for each sequence in the batch
+                        log_likelihoods = []
+                        for idx in range(inputs["input_ids"].size(0)):
+                            input_ids = inputs["input_ids"][idx].unsqueeze(0)  # Process one sequence at a time
+                            labels = input_ids.clone()  # Labels are the same as input_ids for log-likelihood
+                            output = self.classification_model(input_ids=input_ids, labels=labels)
+                            loss = output.loss
+                            log_likelihood = -loss.item()
+                            log_likelihoods.append(log_likelihood)
 
-                    # Compute perplexities and normalize scores
-                    perplexities = [math.exp(-ll) for ll in log_likelihoods]
-                    normalized_scores = [1 / (1 + p) for p in perplexities]
+                        # Compute perplexities and normalize scores
+                        perplexities = [math.exp(-ll) for ll in log_likelihoods]
+                        normalized_scores = [1 / (1 + p) for p in perplexities]
 
-                    quality_scores.extend(normalized_scores)
-            
-            elif self.quality_classifier != "nvidia/domain-classifier":
-                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
-                    batch_texts = texts[i:i + batch_size]
-                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
-                    
-                    # Forward pass for the batch
-                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
-                    outputs = self.classification_model(**inputs)
-                    logits = outputs.logits.squeeze(-1).float().detach()
-                    
-                    # Apply sigmoid to each logit and store the scores
-                    if self.quality_classifier == "HuggingFaceTB/fineweb-edu-classifier":
-                        scores = torch.sigmoid(logits).cpu().numpy()
-                        quality_scores.extend(scores.tolist())
-                    else:
-                        scores = logits.cpu().numpy()
-                        quality_scores.extend(scores.tolist())
-            
-            # Else, tokenize with respect to NVIDIA domain classifier
-            else:
-                for i in tqdm.tqdm(range(0, len(texts), batch_size)):
-                    batch_texts = texts[i:i + batch_size]
-                    inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding="longest", truncation=True)                
-                    
-                    # Forward pass for the batch
-                    inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
-                    outputs = self.classification_model(**inputs)
-                    
-                    # Apply sigmoid to each logit and store the scores
-                    scores = None
-                    if self.classification_normalization == "top_k":
-                        scores = top_k_aggregation(outputs=outputs)
-                    if self.classification_normalization == "softmax_entropy":
-                        scores = softmax_entropy(outputs=outputs)
-                    else:
-                        scores = confidence_threshold(outputs=outputs)
-                    quality_scores.extend(scores.tolist())
+                        quality_scores.extend(normalized_scores)
                 
-            # Adjust shape
-            quality_scores = torch.tensor(quality_scores)
-            quality_scores.unsqueeze(0)
+                elif self.quality_classifier != "nvidia/domain-classifier":
+                    for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                        batch_texts = texts[i:i + batch_size]
+                        inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True)                
+                        
+                        # Forward pass for the batch
+                        inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                        outputs = self.classification_model(**inputs)
+                        logits = outputs.logits.squeeze(-1).float().detach()
+                        
+                        # Apply sigmoid to each logit and store the scores
+                        if self.quality_classifier == "HuggingFaceTB/fineweb-edu-classifier":
+                            scores = torch.sigmoid(logits).cpu().numpy()
+                            quality_scores.extend(scores.tolist())
+                        else:
+                            scores = logits.cpu().numpy()
+                            quality_scores.extend(scores.tolist())
+                
+                # Else, tokenize with respect to NVIDIA domain classifier
+                else:
+                    for i in tqdm.tqdm(range(0, len(texts), batch_size)):
+                        batch_texts = texts[i:i + batch_size]
+                        inputs = self.classification_tokenizer(batch_texts, return_tensors="pt", padding="longest", truncation=True)                
+                        
+                        # Forward pass for the batch
+                        inputs = {key: val.to('cuda') for key, val in inputs.items()} if torch.cuda.is_available() else inputs
+                        outputs = self.classification_model(**inputs)
+                        
+                        # Apply sigmoid to each logit and store the scores
+                        scores = None
+                        if self.classification_normalization == "top_k":
+                            scores = top_k_aggregation(outputs=outputs)
+                        if self.classification_normalization == "softmax_entropy":
+                            scores = softmax_entropy(outputs=outputs)
+                        else:
+                            scores = confidence_threshold(outputs=outputs)
+                        quality_scores.extend(scores.tolist())
+                    
+                # Adjust shape
+                quality_scores = torch.tensor(quality_scores)
+                quality_scores.unsqueeze(0)
             
             # Compute similarites using either cosine-similarity or dot product
             cos_scores = self.score_functions[score_function](
@@ -353,9 +355,10 @@ class DenseRetrievalExactSearch:
             cos_scores[is_nan] = -1
             
             # Adjust cos_scores
-            cos_scores = torch.sigmoid(cos_scores)
-            cos_scores *= self.quality_p
-            cos_scores += (1 - self.quality_p) * quality_scores
+            if self.quality_classifier:
+                cos_scores = torch.sigmoid(cos_scores)
+                cos_scores *= self.quality_p
+                cos_scores += (1 - self.quality_p) * quality_scores
 
             # Get top-k values
             cos_scores_top_k_values, cos_scores_top_k_idx = torch.topk(
